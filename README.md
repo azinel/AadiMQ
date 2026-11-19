@@ -1,127 +1,194 @@
-# AadiMQ - Distributed Job Queue System
-### Production-Grade Backend & Distributed Systems Architecture
+# AadiMQ — Distributed Job Queue System
 
-[![AadiMQ CI Pipeline](https://github.com/azinel/AadiMQ/actions/workflows/ci.yml/badge.svg)](https://github.com/azinel/AadiMQ/actions)
-[![Node.js](https://img.shields.io/badge/Node.js-22.x%20%7C%2020.x%20%7C%2018.x-brightgreen.svg)](https://nodejs.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+### Building a reliable background-processing engine with Node.js, Redis, and PostgreSQL
 
-**AadiMQ** is an industrial-strength, distributed background job processing engine built completely from scratch using **plain JavaScript (Node.js ES Modules)**, **Redis**, and **PostgreSQL**.
+[![AadiMQ CI](https://github.com/azinel/AadiMQ/actions/workflows/ci.yml/badge.svg)](https://github.com/azinel/AadiMQ/actions/workflows/ci.yml)
+[![Node.js](https://img.shields.io/badge/Node.js-18%20%7C%2020%20%7C%2022-brightgreen)](https://nodejs.org/)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
 
-Architecturally designed with the operational resilience of **BullMQ**, **Celery**, and **AWS SQS**, AadiMQ enforces **atomic state transitions via custom Redis Lua scripts**, **cryptographic fencing tokens**, **worker lease heartbeats**, **crash recovery daemons**, **exponential backoff**, **Dead Letter Queues**, and **real-time observability**.
+AadiMQ is a distributed background job-processing system built from scratch with **Node.js ES Modules, Redis, and PostgreSQL**. It separates job submission from execution and coordinates independent workers through Redis-backed queues, atomic Lua operations, and renewable execution leases.
+
+The project focuses on the engineering challenges behind asynchronous processing: concurrent job claims, worker coordination, stalled-job recovery, retries, delayed execution, priority scheduling, dead-letter handling, and operational visibility.
+
+> AadiMQ is a production-oriented systems project. Reliability in a deployment still depends on the runtime topology, persistence configuration, monitoring, and application-level idempotency.
 
 ---
 
-## 1. High-Level System Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    Client["Client / API Consumer"] -->|HTTP POST /api/jobs| API["API Server (Express)"]
-    API -->|1. Idempotency Check & Validate| Producer["Producer Engine"]
-    Producer -->|2. Write System-of-Record| PG[("PostgreSQL\n(Jobs & Executions)")]
-    Producer -->|3. Atomic Enqueue| Redis[("Redis\n(Coordination & Leases)")]
+    Client["Client / API Consumer"] -->|"POST /api/jobs"| API["Express API"]
+    API --> Producer["Producer"]
+    Producer -->|"Persist job record"| PG[("PostgreSQL")]
+    Producer -->|"Queue metadata and state"| Redis[("Redis")]
 
-    subgraph Workers["Distributed Worker Fleet"]
-        W1["Worker 1 (C=4)"]
-        W2["Worker 2 (C=4)"]
-        WN["Worker N (C=4)"]
+    subgraph Runtime["Independent worker processes"]
+      W1["Worker process 1"]
+      W2["Worker process 2"]
+      WN["Worker process N"]
     end
 
-    Redis <-->|Atomic Lua Claims & Heartbeats| Workers
-    Workers -->|Status Audit & Results| PG
+    Redis <-->|"Atomic Lua claim / lease operations"| Runtime
+    Runtime -->|"Execution records and status"| PG
 
-    subgraph Daemons["Control Plane Daemons"]
-        Scheduler["Scheduler (Delayed Promotion)"]
-        Recovery["Recovery Manager (Crash Detection)"]
+    subgraph Control["Queue control components"]
+      Scheduler["Delayed-job Scheduler"]
+      Recovery["Stalled-job Recovery Manager"]
+      Heartbeat["Worker Heartbeat Manager"]
     end
 
-    Scheduler <-->|ZRANGEBYSCORE promote| Redis
-    Recovery <-->|Scan Expired Leases| Redis
-    Recovery -->|Sync Reclaimed Jobs| PG
-    Scheduler -->|Sync Promoted Jobs| PG
+    Scheduler --> Redis
+    Recovery --> Redis
+    Recovery --> PG
+    Heartbeat --> Redis
+    Heartbeat --> PG
 
-    Dashboard["Monitoring Web Dashboard"] <-->|Real-time Poll| API
+    API --> Dashboard["Monitoring Dashboard"]
 ```
 
----
+### Component responsibilities
 
-## 2. Distributed Systems Invariants & Design Principles
-
-### A. At-Least-Once Delivery & Idempotency
-- **No Lost Jobs**: Every job written to PostgreSQL is backed by Redis queues. If a worker crashes midway, the job lease expires and the **Recovery Manager** automatically returns it to the active pool.
-- **Deduplication**: Job submissions accept an optional `idempotencyKey` backed by a unique PostgreSQL constraint, preventing duplicate executions caused by client network timeouts or retries.
-
-### B. Split-Brain & Zombie Worker Prevention (Fencing Tokens)
-When Worker $A$ claims a job, it is issued a unique cryptographic `lockToken`. If Worker $A$ pauses (e.g. GC pause or network partition), its lease in Redis expires. The Recovery Manager reassigns the job to Worker $B$ with a new `lockToken`. When Worker $A$ awakens and attempts to acknowledge completion via `complete_job.lua`, Redis detects the token mismatch (`ERR_FENCE_MISMATCH`) and **rejects Worker $A$'s acknowledgment**, preventing database corruption.
-
-### C. Atomic Transitions via Precompiled Lua Scripts
-Standard multi-key Redis commands without Lua introduce race conditions under high concurrency. All state transitions in AadiMQ are atomic Lua scripts loaded by SHA1 digest (`EVALSHA`):
-
-| Script | Redis Primitives | Purpose |
-| :--- | :--- | :--- |
-| `enqueue_job.lua` | `HSET`, `LPUSH` | Atomically creates `job:<id>` Hash and pushes to `queue:<name>:waiting`. |
-| `claim_job_priority.lua` | `ZPOPMAX`, `RPOP`, `ZADD`, `HSET` | Atomically prioritizes `waiting:priority` ZSET over `waiting` FIFO list, moves to `active` ZSET with lease score, and issues `lockToken`. |
-| `complete_job.lua` | `HGET`, `ZREM`, `HSET`, `EXPIRE` | Verifies fencing lock token, removes from `active`, marks `COMPLETED`, sets retention TTL. |
-| `fail_job_with_backoff.lua` | `ZREM`, `ZADD`, `LPUSH`, `HSET` | Verifies lock token, computes exponential backoff score into `delayed` ZSET, or routes to `dlq` list if `attempts >= maxAttempts`. |
-| `renew_lease.lua` | `HGET`, `ZADD` | Renews the lease expiration timestamp in `active` ZSET for in-flight tasks. |
-| `recover_stalled_jobs.lua` | `ZRANGEBYSCORE`, `ZREM`, `LPUSH` | Scans `active` ZSET where score $\le now$, reclaiming abandoned jobs to `waiting` or `dlq`. |
-| `promote_delayed_jobs.lua` | `ZRANGEBYSCORE`, `ZREM`, `ZADD`, `LPUSH` | Matures delayed jobs whose timestamp has arrived into active waiting queues. |
-| `cancel_job.lua` | `LREM`, `ZREM`, `HSET` | Atomically removes jobs from pending queues and marks `CANCELLED`. |
-| `rate_limit.lua` | `ZREMRANGEBYSCORE`, `ZCARD`, `ZADD` | Sliding-window rate limiter preventing queue exhaustion. |
+| Component | Responsibility |
+|---|---|
+| **Producer** | Validates job input, checks idempotency keys, persists job records, and places jobs into FIFO, priority, or delayed Redis structures. |
+| **Redis** | Coordinates waiting, priority, delayed, active, and dead-letter queues, along with worker and lease metadata. |
+| **Worker** | Claims jobs, executes a supplied processor, renews leases, enforces execution timeouts, and records outcomes. |
+| **Scheduler** | Promotes delayed jobs when their scheduled time arrives. |
+| **Recovery Manager** | Detects expired active leases and requeues stalled jobs or moves exhausted jobs to the DLQ. |
+| **PostgreSQL** | Stores durable job records, execution history, worker records, and queue metadata. |
+| **Express API & Dashboard** | Exposes job and queue operations, health checks, worker information, and a browser-based monitoring view. |
 
 ---
 
-## 3. Technology Stack
+## Core engineering concepts
 
-- **Runtime**: Node.js v18+ (Plain JavaScript ES Modules: `"type": "module"`)
-- **Web API**: Express.js
-- **Coordination Engine**: Redis 7 (via `ioredis` with exponential connection retries)
-- **Persistent Database**: PostgreSQL 16
-- **ORM / Migrations**: Prisma ORM
-- **Testing**: Jest (Experimental VM Modules), Supertest, `redis-memory-server`
-- **Load Testing**: k6
-- **Containerization**: Docker & Docker Compose
-- **CI/CD**: GitHub Actions
+### 1. Atomic job claiming
+
+Workers compete for jobs from shared Redis data structures. Critical claim and state-transition operations are implemented as Lua scripts, so Redis-side changes execute atomically rather than as multiple interleavable client commands. The priority-aware claim path checks the priority sorted set before the FIFO waiting list, then moves the selected job into the active set and associates it with a worker lease.
+
+### 2. Worker leases and heartbeats
+
+A worker receives a lease when it claims a job. The heartbeat manager periodically renews active leases while processing continues. This helps distinguish healthy long-running work from jobs whose workers have stopped renewing their leases.
+
+### 3. Fencing tokens
+
+Claims use unique lock tokens. Completion and failure operations validate the token associated with the active claim before accepting a state transition. This prevents an outdated worker claim from acknowledging a job after it has been reclaimed by another worker.
+
+### 4. Stalled-job recovery
+
+The Recovery Manager scans active jobs for expired leases. It requeues recoverable jobs and moves jobs that have exhausted their allowed attempts to the dead-letter queue. Worker records can also be marked offline after heartbeat timeouts.
+
+### 5. Retry and dead-letter handling
+
+Failed jobs can be retried with exponential backoff. Once the configured attempt limit is exhausted, the job is moved to the **Dead Letter Queue (DLQ)**. A retry API allows a dead-lettered job to be replayed.
+
+### 6. Scheduling and priority
+
+- FIFO job processing.
+- Priority-aware job selection.
+- Delayed job submission and promotion.
+- Job cancellation while pending.
+- Sliding-window rate limiting through a Redis Lua script.
+
+### 7. Idempotent submission
+
+Job submission accepts an optional `idempotencyKey`. A unique constraint in PostgreSQL prevents the same key from creating multiple job records, supporting safe client retries after uncertain network responses.
 
 ---
 
-## 4. REST API Specification
+## Redis Lua script registry
 
-### Job Management
+The queue's coordination operations are implemented as dedicated Lua scripts. Scripts are loaded into Redis and invoked with `EVALSHA`, with an `EVAL` fallback when necessary.
+
+| Script | Purpose |
+|---|---|
+| `claim_job.lua` | Atomically claims a waiting job. |
+| `claim_job_priority.lua` | Claims a priority job before falling back to FIFO. |
+| `complete_job.lua` | Validates the lock token and marks a job complete. |
+| `fail_job.lua` | Handles a failed job transition. |
+| `fail_job_with_backoff.lua` | Schedules retry backoff or moves exhausted jobs to the DLQ. |
+| `renew_lease.lua` | Renews an active job's lease. |
+| `recover_stalled_jobs.lua` | Reclaims jobs with expired leases. |
+| `promote_delayed_jobs.lua` | Moves matured delayed jobs into waiting queues. |
+| `cancel_job.lua` | Removes a pending job and marks it cancelled. |
+| `rate_limit.lua` | Applies a sliding-window rate limit. |
+| `replay_dlq_job.lua` | Replays a dead-lettered job. |
+| `enqueue_job.lua` | Atomic Redis enqueue operation available in the script registry. |
+
+> **Implementation note:** The current `Producer.enqueue()` persists the PostgreSQL record and then writes Redis job metadata and the queue entry using Redis client commands. The presence of `enqueue_job.lua` in the registry should not be read as proof that the Producer currently invokes it.
+
+---
+
+## Technology stack
+
+| Area | Technologies |
+|---|---|
+| Runtime | Node.js, JavaScript ES Modules |
+| API | Express.js |
+| Queue coordination | Redis 7, ioredis, Redis Lua |
+| Persistent storage | PostgreSQL 16 |
+| Data access | Prisma ORM |
+| Input validation | Zod |
+| Testing | Jest, Supertest, Redis Memory Server |
+| Load testing | k6 scripts |
+| Local infrastructure | Docker, Docker Compose |
+| CI | GitHub Actions |
+
+The CI workflow runs the test suite against Node.js **18.x, 20.x, and 22.x**, with PostgreSQL 16 and Redis 7 services.
+
+---
+
+## REST API
+
+### Job management
+
 | Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/api/jobs` | Enqueue a job (supports priority, delay, maxAttempts, idempotencyKey). |
-| `GET` | `/api/jobs/:id` | Fetch job details (checks Redis fast path, falls back to PostgreSQL). |
-| `GET` | `/api/jobs` | List jobs with pagination (`page`, `limit`) and filtering (`queue`, `status`). |
-| `DELETE` | `/api/jobs/:id` | Cancel a pending or delayed job before execution. |
-| `POST` | `/api/jobs/:id/retry` | Replay / retry a dead-lettered job from DLQ. |
+|---|---|---|
+| `POST` | `/api/jobs` | Submit a job with queue, priority, delay, retry limit, and optional idempotency key. |
+| `GET` | `/api/jobs` | List jobs with pagination and queue/status filters. |
+| `GET` | `/api/jobs/:id` | Retrieve job details. |
+| `DELETE` | `/api/jobs/:id` | Cancel a pending or delayed job. |
+| `POST` | `/api/jobs/:id/retry` | Replay a dead-lettered job. |
 
-### Queues & Metrics
+### Queues, workers, and health
+
 | Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/api/queues` | Returns all queues with counts (waiting, active, delayed, DLQ, completed). |
-| `GET` | `/api/queues/:name/stats` | Deep latency metrics (avg, min, max execution duration) for a queue. |
-| `GET` | `/api/workers` | Real-time worker registry, active job counts, and heartbeat statuses. |
-| `GET` | `/api/health` | Health probe checking Redis and PostgreSQL connectivity. |
-| `GET` | `/dashboard` | Live HTML5 / React monitoring dashboard. |
+|---|---|---|
+| `GET` | `/api/queues` | List queues and their state counts. |
+| `GET` | `/api/queues/:name/stats` | Retrieve queue execution and latency statistics. |
+| `GET` | `/api/workers` | List registered workers and heartbeat information. |
+| `GET` | `/api/health` | Check service dependencies. |
+| `GET` | `/dashboard` | Open the monitoring dashboard. |
 
 ---
 
-## 5. Getting Started & Local Development
+## Getting started
 
-### 1. Clone & Install Dependencies
+### Prerequisites
+
+- Node.js 18 or later
+- Docker and Docker Compose
+- npm
+
+### 1. Clone the repository
+
 ```bash
 git clone https://github.com/azinel/AadiMQ.git
 cd AadiMQ
 npm install
 ```
 
-### 2. Environment Configuration
-Create a `.env` file from the template:
+### 2. Configure environment variables
+
+Copy the example file:
+
 ```bash
 cp .env.example .env
 ```
 
-Ensure `DATABASE_URL` and `REDIS_URL` point to your local or containerized instances:
+Configure the connection strings for your local PostgreSQL and Redis instances. A typical local configuration is:
+
 ```ini
 PORT=3000
 NODE_ENV=development
@@ -132,72 +199,163 @@ WORKER_CONCURRENCY=2
 JOB_LEASE_MS=30000
 ```
 
-### 3. Start Database and Redis via Docker Compose
+Use the variable names and any additional required settings from the repository's `.env.example` as the source of truth.
+
+### 3. Start PostgreSQL and Redis
+
 ```bash
 docker compose up -d postgres redis
 ```
 
-### 4. Push Prisma Database Schema
+### 4. Generate Prisma Client and sync the schema
+
 ```bash
 npm run prisma:generate
 npm run prisma:push
 ```
 
-### 5. Start API Server & Workers
-```bash
-# Terminal 1: Start API Server & Monitoring Dashboard
-npm start
+### 5. Start the API and worker
 
-# Terminal 2: Start Background Worker Process
+Run each process in a separate terminal:
+
+```bash
+# Terminal 1 — API and monitoring dashboard
+npm start
+```
+
+```bash
+# Terminal 2 — background worker
 npm run worker
 ```
 
-Access the **Live Monitoring Dashboard** at [http://localhost:3000/dashboard](http://localhost:3000/dashboard).
+Open the dashboard at [http://localhost:3000/dashboard](http://localhost:3000/dashboard).
+
+> The worker entry point currently uses a sample processor to simulate job execution. Replace it with your application-specific processor when integrating AadiMQ into another service.
 
 ---
 
-## 6. Automated Testing
+## Testing
 
-AadiMQ includes comprehensive unit and integration test suites covering all phases:
-- `tests/unit/job.test.js`: Domain entity serialization, validation, and terminal states.
-- `tests/integration/phase1_queue.test.js`: Core FIFO claim/execute/complete lifecycle.
-- `tests/integration/phase2_concurrency.test.js`: Multi-worker race-condition tests (50 jobs across 4 competing workers with 0 duplicate claims).
-- `tests/integration/phase3_coordination.test.js`: Heartbeat lease renewal & worker crash recovery.
-- `tests/integration/phase4_fault_tolerance.test.js`: Exponential backoff, timeout protection, DLQ replay.
-- `tests/integration/phase5_scheduling.test.js`: Priority ordering, delayed job scheduler promotion, job cancellation, sliding-window rate limiting.
-- `tests/integration/phase6_monitoring.test.js`: Statistics aggregation and dashboard endpoints.
+Run the test suite:
 
-Run the entire automated test suite:
 ```bash
 npm test
 ```
 
+The repository's test suites cover:
+
+| Test suite | Coverage |
+|---|---|
+| `tests/unit/job.test.js` | Job entity validation, serialization, and state behavior. |
+| `tests/integration/phase1_queue.test.js` | Core enqueue, claim, execute, and completion flow. |
+| `tests/integration/phase2_concurrency.test.js` | Concurrent processing and duplicate-claim checks across workers. |
+| `tests/integration/phase3_coordination.test.js` | Worker registration, heartbeat lease renewal, and stalled-job recovery. |
+| `tests/integration/phase4_fault_tolerance.test.js` | Retry backoff, DLQ transitions, timeout handling, and DLQ replay. |
+| `tests/integration/phase5_scheduling.test.js` | Priority, delayed scheduling, cancellation, and rate limiting. |
+| `tests/integration/phase6_monitoring.test.js` | Queue statistics and monitoring API behavior. |
+
+The concurrency integration tests include a scenario with **50 jobs and 4 competing workers**, asserting that each job is completed once during that test run.
+
 ---
 
-## 7. Performance Benchmarking with k6
+## Load testing
 
-Load test scripts are located in `k6/`:
+The `k6/` directory contains load-test scripts:
 
 ```bash
-# 1. Enqueue stress test (50 Virtual Users submitting jobs concurrently)
+# Concurrent job submission
 k6 run k6/enqueue_stress.js
 
-# 2. Read query throughput benchmark (health, queue stats, worker fleet)
+# Read/query throughput
 k6 run k6/throughput_benchmark.js
 ```
 
+Run these against an isolated test environment, not a production database or queue.
+
 ---
 
-## 8. Deployment via Docker Compose
+## Run the full stack with Docker Compose
 
-To deploy the entire distributed system (API Server + Background Worker Pool + PostgreSQL + Redis):
+Build and start the API, worker, PostgreSQL, and Redis services:
+
 ```bash
 docker compose up -d --build
 ```
-This boots:
-- `aadimq-postgres`: PostgreSQL 16 container with durable volume.
-- `aadimq-redis`: Redis 7 Alpine container with AOF persistence.
-- `aadimq-api`: Express API Server with health checks on port 3000.
-- `aadimq-worker`: Independent Worker process automatically processing jobs.
-#   a a d i M Q  
- 
+
+| Service | Container | Role |
+|---|---|---|
+| PostgreSQL | `aadimq-postgres` | Persistent job and execution records. |
+| Redis | `aadimq-redis` | Queue state, coordination, and leases; AOF persistence enabled. |
+| API | `aadimq-api` | Express API and monitoring dashboard on port 3000. |
+| Worker | `aadimq-worker` | Independent job-processing process. |
+
+Stop the stack:
+
+```bash
+docker compose down
+```
+
+To also remove the local database and Redis data volumes:
+
+```bash
+docker compose down -v
+```
+
+> **Warning:** `docker compose down -v` permanently removes the named volumes created for this local stack.
+
+---
+
+## Repository structure
+
+```text
+AadiMQ/
+├── .github/workflows/ci.yml
+├── prisma/schema.prisma
+├── public/
+├── src/
+│   ├── api/
+│   │   ├── controllers/
+│   │   ├── middlewares/
+│   │   ├── routes/
+│   │   └── server.js
+│   ├── config/
+│   ├── queue/
+│   │   ├── job.js
+│   │   ├── producer.js
+│   │   └── stats.js
+│   ├── redis/
+│   │   ├── scripts/
+│   │   ├── client.js
+│   │   └── scriptLoader.js
+│   ├── scheduler/
+│   │   ├── recoveryManager.js
+│   │   └── scheduler.js
+│   ├── utils/
+│   ├── worker/
+│   │   ├── heartbeat.js
+│   │   ├── worker.js
+│   │   ├── workerPool.js
+│   │   └── start.js
+│   └── index.js
+├── tests/
+│   ├── unit/
+│   └── integration/
+├── k6/
+├── docker-compose.yml
+├── Dockerfile
+└── package.json
+```
+
+---
+
+## Engineering focus
+
+AadiMQ is primarily a systems-engineering project. Its central challenges are coordinating concurrent consumers, defining safe job-state transitions, detecting stalled work, handling retries, and keeping operational state observable across Redis and PostgreSQL.
+
+The project explores trade-offs in **at-least-once processing**, **idempotent submission**, **lease-based coordination**, and **recovery from worker failure**. These mechanisms do not make arbitrary job handlers exactly-once: application processors should still be idempotent, especially when performing external side effects.
+
+---
+
+## License
+
+This repository currently declares the **ISC License** in `package.json`.
