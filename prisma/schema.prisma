@@ -1,0 +1,93 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum JobStatus {
+  WAITING
+  DELAYED
+  ACTIVE
+  COMPLETED
+  FAILED
+  DEAD_LETTER
+  CANCELLED
+}
+
+enum WorkerStatus {
+  ONLINE
+  DRAINING
+  OFFLINE
+}
+
+model Job {
+  id             String         @id @default(uuid())
+  queueName      String         @map("queue_name")
+  jobType        String         @map("job_type")
+  payload        Json
+  status         JobStatus      @default(WAITING)
+  priority       Int            @default(0)
+  attempts       Int            @default(0)
+  maxAttempts    Int            @default(3) @map("max_attempts")
+  idempotencyKey String?        @unique @map("idempotency_key")
+
+  scheduledFor   DateTime?      @map("scheduled_for")
+  startedAt      DateTime?      @map("started_at")
+  completedAt    DateTime?      @map("completed_at")
+  failedAt       DateTime?      @map("failed_at")
+  failureReason  String?        @map("failure_reason")
+
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  executions     JobExecution[]
+
+  @@index([queueName, status])
+  @@index([status, scheduledFor])
+  @@map("jobs")
+}
+
+model JobExecution {
+  id         String    @id @default(uuid())
+  jobId      String    @map("job_id")
+  workerId   String    @map("worker_id")
+  attempt    Int
+  status     JobStatus
+  startedAt  DateTime  @default(now()) @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  durationMs Int?      @map("duration_ms")
+  error      String?
+  result     Json?
+
+  job        Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([workerId])
+  @@map("job_executions")
+}
+
+model Worker {
+  id            String       @id
+  hostname      String
+  pid           Int
+  status        WorkerStatus @default(ONLINE)
+  concurrency   Int          @default(1)
+  startedAt     DateTime     @default(now()) @map("started_at")
+  lastHeartbeat DateTime     @default(now()) @map("last_heartbeat")
+
+  @@map("workers")
+}
+
+model QueueMetadata {
+  id             String   @id @default(uuid())
+  name           String   @unique
+  isPaused       Boolean  @default(false) @map("is_paused")
+  maxConcurrency Int      @default(10) @map("max_concurrency")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("queue_metadata")
+}

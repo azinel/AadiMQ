@@ -1,0 +1,42 @@
+{
+  "name": "aadimq",
+  "version": "1.0.0",
+  "description": "Production-oriented Distributed Job Queue System built with Node.js, Redis, and PostgreSQL",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "worker": "node src/worker/start.js",
+    "prisma:generate": "prisma generate",
+    "prisma:push": "prisma db push",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand --detectOpenHandles --forceExit",
+    "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch"
+  },
+  "keywords": [
+    "distributed-systems",
+    "job-queue",
+    "redis",
+    "postgresql",
+    "prisma",
+    "nodejs"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "ioredis": "^5.4.1",
+    "uuid": "^10.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "ioredis-mock": "^8.9.0",
+    "jest": "^29.7.0",
+    "prisma": "^5.22.0",
+    "redis-memory-server": "^0.17.2",
+    "redis-server": "^1.2.2",
+    "supertest": "^7.0.0"
+  }
+}
